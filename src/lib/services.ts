@@ -5,11 +5,7 @@ import { z } from 'zod';
 // longer points at the real node_modules/pdfkit folder, so that lookup fails
 // with ENOENT. The standalone build embeds the font data directly in the JS
 // instead of reading it from disk, so it works regardless of how it's bundled.
-declare module 'pdfkit/js/pdfkit.standalone.js' {
-  import type PDFDocumentType from 'pdfkit';
-  const PDFDocument: typeof PDFDocumentType;
-  export default PDFDocument;
-}
+
 import PDFDocument from 'pdfkit/js/pdfkit.standalone.js';
 import mammoth from 'mammoth';
 import { ROLE_SKILLS, SKILL_ALIASES, SUPPORTED_ROLES } from './role-skills';
