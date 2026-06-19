@@ -1,6 +1,16 @@
 import OpenAI from 'openai';
 import { z } from 'zod';
-import PDFDocument from 'pdfkit';
+// pdfkit's normal build reads its font metrics (Helvetica.afm, etc.) off disk
+// using __dirname at runtime. Under Next.js/Turbopack bundling, __dirname no
+// longer points at the real node_modules/pdfkit folder, so that lookup fails
+// with ENOENT. The standalone build embeds the font data directly in the JS
+// instead of reading it from disk, so it works regardless of how it's bundled.
+declare module 'pdfkit/js/pdfkit.standalone.js' {
+  import type PDFDocumentType from 'pdfkit';
+  const PDFDocument: typeof PDFDocumentType;
+  export default PDFDocument;
+}
+import PDFDocument from 'pdfkit/js/pdfkit.standalone.js';
 import mammoth from 'mammoth';
 import { ROLE_SKILLS, SKILL_ALIASES, SUPPORTED_ROLES } from './role-skills';
 import type { SupportedRole } from './role-skills';
@@ -315,11 +325,12 @@ export async function parseResumePDF(buffer: Buffer): Promise<string> {
 async function parsePDFWithPdfParse(buffer: Buffer): Promise<string> {
   // pdf-parse has a quirky export shape that breaks under Next.js/Turbopack's
   // module resolution. We try all three known export shapes in order.
-  const mod = await import('pdf-parse');
-  const pdfParse =
-    typeof mod.default === 'function' ? mod.default :
-      typeof (mod as any).default?.default === 'function' ? (mod as any).default.default :
-        typeof (mod as any) === 'function' ? (mod as any) :
+  // Cast to `any` — pdf-parse ESM types don't expose `.default` but runtime does
+  const mod = await import('pdf-parse') as any;
+  const pdfParse: ((buf: Buffer, opts?: object) => Promise<{ text: string }>) | null =
+    typeof mod.default?.default === 'function' ? mod.default.default :
+      typeof mod.default === 'function' ? mod.default :
+        typeof mod === 'function' ? mod :
           null;
   if (!pdfParse) throw new Error('pdfParse is not a function');
   const result = await pdfParse(buffer, { max: 0 });

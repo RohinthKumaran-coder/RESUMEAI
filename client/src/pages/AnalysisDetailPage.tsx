@@ -180,6 +180,16 @@ function WeekCard({ week }: { week: WeekPlan }) {
   );
 }
 
+// ─── TrendingUp Icon ──────────────────────────────────────────────────────────
+function TrendingUp(props: React.SVGProps<SVGSVGElement>) {
+  return (
+    <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" {...props}>
+      <polyline points="22,7 13.5,15.5 8.5,10.5 2,17" />
+      <polyline points="16,7 22,7 22,13" />
+    </svg>
+  );
+}
+
 // ─── Main Page ─────────────────────────────────────────────────────────────────
 export function AnalysisDetailPage() {
   const { id } = useParams<{ id: string }>();
@@ -197,15 +207,27 @@ export function AnalysisDetailPage() {
   const a = currentAnalysis;
 
   const handleExportPDF = () => {
-    if (!id) return;
-    analysisApi.exportPDF(id);
-    toast({ title: '📄 Generating PDF...', description: 'Your report will download shortly.' });
+    // window.print() must be called synchronously inside the click handler —
+    // delaying it (e.g. via setTimeout) breaks the browser's user-gesture
+    // requirement and the print dialog silently fails to open.
+    const handleAfterPrint = () => {
+      toast({ title: '✅ PDF export complete', description: 'Check your downloads if you chose "Save as PDF".' });
+      window.removeEventListener('afterprint', handleAfterPrint);
+    };
+    window.addEventListener('afterprint', handleAfterPrint);
+
+    toast({ title: '🖨️ Opening print dialog...', description: 'Set destination to "Save as PDF".' });
+    window.print();
   };
 
-  const handleExportCSV = () => {
+  const handleExportCSV = async () => {
     if (!id) return;
-    analysisApi.exportCSV(id);
-    toast({ title: '📊 Generating CSV...', description: 'Your file will download shortly.' });
+    try {
+      toast({ title: '📊 Generating CSV...', description: 'Your file will download shortly.' });
+      await analysisApi.exportCSV(id);
+    } catch (e: any) {
+      toast({ title: 'Export failed', description: e.message || 'Could not generate CSV.', variant: 'destructive' });
+    }
   };
 
   const handleGenQuestions = async () => {
@@ -235,7 +257,6 @@ export function AnalysisDetailPage() {
     );
   }
 
-  // Radar chart data
   const allRequired = [...a.matchedSkills, ...a.missingSkills];
   const radarData = allRequired.slice(0, 8).map((skill) => ({
     skill: skill.length > 12 ? skill.slice(0, 12) + '…' : skill,
@@ -243,14 +264,12 @@ export function AnalysisDetailPage() {
     required: 100,
   }));
 
-  // Bar chart data
   const barData = [
     { name: 'Matched', value: a.matchedSkills.length, fill: '#10B981' },
     { name: 'Missing', value: a.missingSkills.length, fill: '#EF4444' },
     { name: 'Recommended', value: Math.min(5, a.missingSkills.length), fill: '#3B82F6' },
   ];
 
-  // Group resources by skill
   const skillsWithResources = [...new Set((a.learningResources || []).map((r) => r.skill))];
   const filteredResources = skillFilter === 'all'
     ? a.learningResources || []
@@ -258,10 +277,32 @@ export function AnalysisDetailPage() {
 
   return (
     <div className="min-h-screen bg-[hsl(var(--background))]">
+      <style>{`
+        @media print {
+          @page { size: A4; margin: 16mm 14mm; }
+          * { -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
+          nav, [data-no-print] { display: none !important; }
+          body { background: #ffffff !important; color: #111827 !important; font-size: 11pt; }
+          h1, h2, h3, h4 { page-break-after: avoid; }
+          [class*="card"], [class*="rounded-xl"] {
+            border: 1px solid #e5e7eb !important;
+            box-shadow: none !important;
+            page-break-inside: avoid;
+          }
+          [class*="badge"] {
+            border: 1px solid #d1d5db !important;
+            background: #f3f4f6 !important;
+            color: #111827 !important;
+          }
+          .recharts-wrapper { max-height: 200px !important; }
+          p, li { orphans: 3; widows: 3; }
+        }
+      `}</style>
+
       <Navbar />
 
-      {/* Sticky Export Bar */}
-      <div className="sticky top-16 z-40 glass border-b border-[hsl(var(--border))]">
+      {/* Sticky Export Bar — hidden when printing */}
+      <div data-no-print className="sticky top-16 z-40 glass border-b border-[hsl(var(--border))]">
         <div className="max-w-7xl mx-auto px-4 py-3 flex items-center justify-between gap-4">
           <Button variant="ghost" size="sm" onClick={() => navigate('/dashboard')} className="gap-2">
             <ArrowLeft className="w-4 h-4" /> Dashboard
@@ -293,7 +334,6 @@ export function AnalysisDetailPage() {
               </CardTitle>
             </CardHeader>
             <CardContent className="space-y-6">
-              {/* Basic info */}
               <div className="flex flex-col sm:flex-row gap-6">
                 <div className="flex-shrink-0">
                   <div className="w-20 h-20 rounded-2xl gradient-primary flex items-center justify-center shadow-md">
@@ -315,7 +355,6 @@ export function AnalysisDetailPage() {
                 </div>
               </div>
 
-              {/* AI Summary */}
               {a.candidateSummary && (
                 <div className="bg-blue-500/5 border border-blue-500/20 rounded-xl p-4">
                   <div className="flex items-center gap-2 mb-2">
@@ -326,7 +365,6 @@ export function AnalysisDetailPage() {
                 </div>
               )}
 
-              {/* Education */}
               {a.education?.length > 0 && (
                 <div>
                   <h4 className="flex items-center gap-2 font-semibold text-sm mb-3">
@@ -346,7 +384,6 @@ export function AnalysisDetailPage() {
                 </div>
               )}
 
-              {/* Experience */}
               {a.experience?.length > 0 && (
                 <div>
                   <h4 className="flex items-center gap-2 font-semibold text-sm mb-3">
@@ -371,7 +408,6 @@ export function AnalysisDetailPage() {
                 </div>
               )}
 
-              {/* Projects */}
               {a.projects?.length > 0 && (
                 <div>
                   <h4 className="flex items-center gap-2 font-semibold text-sm mb-3">
@@ -391,7 +427,6 @@ export function AnalysisDetailPage() {
                 </div>
               )}
 
-              {/* Certifications */}
               {a.certifications?.length > 0 && (
                 <div>
                   <h4 className="flex items-center gap-2 font-semibold text-sm mb-3">
@@ -414,7 +449,6 @@ export function AnalysisDetailPage() {
 
         {/* ── B+C: Skill Analysis + Readiness ──────────────────────────────── */}
         <div className="grid lg:grid-cols-3 gap-6">
-          {/* Skill Analysis (2/3) */}
           <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.1 }} className="lg:col-span-2">
             <Card className="h-full">
               <CardHeader>
@@ -424,7 +458,6 @@ export function AnalysisDetailPage() {
                 </CardTitle>
               </CardHeader>
               <CardContent className="space-y-6">
-                {/* Radar Chart */}
                 {radarData.length > 0 && (
                   <div className="h-64">
                     <ResponsiveContainer width="100%" height="100%">
@@ -439,7 +472,6 @@ export function AnalysisDetailPage() {
                   </div>
                 )}
 
-                {/* Progress bars */}
                 <div className="space-y-3">
                   <div>
                     <div className="flex justify-between text-sm mb-1.5">
@@ -450,7 +482,6 @@ export function AnalysisDetailPage() {
                   </div>
                 </div>
 
-                {/* Skill Badges */}
                 {a.matchedSkills.length > 0 && (
                   <div>
                     <p className="text-sm font-semibold text-emerald-600 mb-2 flex items-center gap-1.5">
@@ -477,7 +508,6 @@ export function AnalysisDetailPage() {
                   </div>
                 )}
 
-                {/* Bar chart */}
                 <div className="h-32">
                   <ResponsiveContainer width="100%" height="100%">
                     <BarChart data={barData} layout="vertical">
@@ -494,7 +524,6 @@ export function AnalysisDetailPage() {
             </Card>
           </motion.div>
 
-          {/* Readiness Score (1/3) */}
           <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.15 }}>
             <Card className="h-full">
               <CardHeader>
@@ -534,18 +563,9 @@ export function AnalysisDetailPage() {
                   Learning Recommendations
                 </CardTitle>
                 <div className="flex flex-wrap gap-2">
-                  <Button
-                    variant={skillFilter === 'all' ? 'default' : 'outline'}
-                    size="sm"
-                    onClick={() => setSkillFilter('all')}
-                  >All</Button>
+                  <Button variant={skillFilter === 'all' ? 'default' : 'outline'} size="sm" onClick={() => setSkillFilter('all')}>All</Button>
                   {skillsWithResources.slice(0, 5).map((s) => (
-                    <Button
-                      key={s}
-                      variant={skillFilter === s ? 'default' : 'outline'}
-                      size="sm"
-                      onClick={() => setSkillFilter(s)}
-                    >{s}</Button>
+                    <Button key={s} variant={skillFilter === s ? 'default' : 'outline'} size="sm" onClick={() => setSkillFilter(s)}>{s}</Button>
                   ))}
                 </div>
               </CardHeader>
@@ -592,7 +612,6 @@ export function AnalysisDetailPage() {
                       HR <Badge variant="info" className="text-[10px] hidden sm:flex">{a.interviewQuestions.hr.length}</Badge>
                     </TabsTrigger>
                   </TabsList>
-
                   {(['technical', 'project', 'scenario', 'hr'] as const).map((cat) => (
                     <TabsContent key={cat} value={cat}>
                       <div className="space-y-3">
@@ -634,7 +653,6 @@ export function AnalysisDetailPage() {
               {a.preparationRoadmap ? (
                 <div className="space-y-4">
                   {a.preparationRoadmap.weeks.map((week) => <WeekCard key={week.week} week={week} />)}
-
                   {a.preparationRoadmap.tips?.length > 0 && (
                     <div className="bg-blue-500/5 border border-blue-500/20 rounded-xl p-5">
                       <h4 className="font-semibold text-blue-600 mb-3 flex items-center gap-2">
@@ -664,17 +682,8 @@ export function AnalysisDetailPage() {
             </CardContent>
           </Card>
         </motion.div>
+
       </div>
     </div>
-  );
-}
-
-// Need this for the TrendingUp icon used below
-function TrendingUp(props: React.SVGProps<SVGSVGElement>) {
-  return (
-    <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" {...props}>
-      <polyline points="22,7 13.5,15.5 8.5,10.5 2,17" />
-      <polyline points="16,7 22,7 22,13" />
-    </svg>
   );
 }

@@ -10,7 +10,7 @@ interface AnalysisState {
   creatingStep: string;
   error: string | null;
 
-  createAnalysis: (file: File, targetRole: string) => Promise<Analysis>;
+  createAnalysis: (file: File, roles: string[], customRole?: string, targetCompany?: string, jobDescription?: string) => Promise<Analysis>;
   fetchAnalysis: (id: string) => Promise<void>;
   fetchAnalyses: () => Promise<void>;
   deleteAnalysis: (id: string) => Promise<void>;
@@ -28,13 +28,13 @@ export const useAnalysisStore = create<AnalysisState>((set, get) => ({
   creatingStep: '',
   error: null,
 
-  createAnalysis: async (file, targetRole) => {
+  createAnalysis: async (file, roles, customRole?, targetCompany?, jobDescription?) => {
     set({ isCreating: true, error: null, creatingStep: 'Uploading resume...' });
     try {
       set({ creatingStep: 'Parsing PDF content...' });
       await new Promise((r) => setTimeout(r, 500));
       set({ creatingStep: 'Analyzing with AI...' });
-      const analysis = await analysisApi.create(file, targetRole);
+      const analysis = await analysisApi.create(file, roles, customRole, targetCompany, jobDescription);
       set((state) => ({
         analyses: [analysis, ...state.analyses],
         currentAnalysis: analysis,
