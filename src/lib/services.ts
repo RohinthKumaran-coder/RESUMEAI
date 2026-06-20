@@ -1,12 +1,9 @@
 import OpenAI from 'openai';
 import { z } from 'zod';
-// pdfkit's normal build reads its font metrics (Helvetica.afm, etc.) off disk
-// using __dirname at runtime. Under Next.js/Turbopack bundling, __dirname no
-// longer points at the real node_modules/pdfkit folder, so that lookup fails
-// with ENOENT. The standalone build embeds the font data directly in the JS
-// instead of reading it from disk, so it works regardless of how it's bundled.
-
-import PDFDocument from 'pdfkit';
+// pdfkit standalone build embeds all font data in JS — no disk reads at runtime.
+// This is required for Vercel/Next.js where bundling strips node_modules assets.
+// @ts-ignore — standalone build types are declared in src/types/pdfkit-standalone.d.ts
+import PDFDocument from 'pdfkit/js/pdfkit.standalone.js';
 import mammoth from 'mammoth';
 import { ROLE_SKILLS, SKILL_ALIASES, SUPPORTED_ROLES } from './role-skills';
 import type { SupportedRole } from './role-skills';
@@ -16,14 +13,9 @@ import type { SupportedRole } from './role-skills';
 const GROQ_TEXT_MODEL = 'llama-3.3-70b-versatile';
 const GROQ_VISION_MODEL = 'meta-llama/llama-4-scout-17b-16e-instruct';
 
-// ─── Groq Key Pool + Failover ──────────────────────────────────────────────────
-//
-// 3 keys tried in order on every callGroq() invocation. A key is skipped to
-// the next one on 429 (rate limit) / 401 / 403 (invalid/exhausted). Any other
-// error (bad request, network) aborts immediately — retrying other keys won't
-// help. If ALL 3 keys are exhausted, callGroq() throws GroqAllKeysExhaustedError,
-// which every caller below already catches and falls back to its own offline
-// fallback (hardcoded fallback questions, empty profile, local skill match, etc).
+// ─── Groq Key Pool + Failover ─────────────────────────────────────────────────
+// 3 keys tried in order. Skips to next key on 429/401/403. Other errors abort.
+// If all keys fail, throws GroqAllKeysExhaustedError — every caller has a fallback.
 
 const GROQ_KEYS = [
   process.env.GROQ_API_KEY_1,
@@ -32,25 +24,22 @@ const GROQ_KEYS = [
 ].filter((k): k is string => typeof k === 'string' && k.trim().length > 0);
 
 if (GROQ_KEYS.length === 0) {
-  console.warn('[groq] No GROQ_API_KEY_1/2/3 configured — all AI calls will go straight to local fallback.');
+  console.warn('[groq] No GROQ_API_KEY_1/2/3 configured — all AI calls will use local fallback.');
 }
 
 const _groqClients = new Map<string, OpenAI>();
-function getGroqClientForKey(key: string): OpenAI {
-  let client = _groqClients.get(key);
-  if (!client) {
-    client = new OpenAI({ apiKey: key, baseURL: 'https://api.groq.com/openai/v1' });
-    _groqClients.set(key, client);
+function getGroqClient(key: string): OpenAI {
+  let c = _groqClients.get(key);
+  if (!c) {
+    c = new OpenAI({ apiKey: key, baseURL: 'https://api.groq.com/openai/v1' });
+    _groqClients.set(key, c);
   }
-  return client;
+  return c;
 }
 
-function isExhaustedKeyError(err: unknown): boolean {
-  const status =
-    (err as any)?.status ??
-    (err as any)?.response?.status ??
-    (err as any)?.statusCode;
-  return status === 429 || status === 401 || status === 403;
+function isRateLimitError(err: unknown): boolean {
+  const s = (err as any)?.status ?? (err as any)?.response?.status ?? (err as any)?.statusCode;
+  return s === 429 || s === 401 || s === 403;
 }
 
 export class GroqAllKeysExhaustedError extends Error {
@@ -60,23 +49,19 @@ export class GroqAllKeysExhaustedError extends Error {
   }
 }
 
-/** Runs `makeRequest` against each configured Groq key in order until one succeeds. */
 async function withGroqFailover<T>(makeRequest: (client: OpenAI) => Promise<T>): Promise<T> {
-  if (GROQ_KEYS.length === 0) {
-    throw new GroqAllKeysExhaustedError(new Error('No Groq keys configured'));
-  }
-
+  if (GROQ_KEYS.length === 0) throw new GroqAllKeysExhaustedError(new Error('No Groq keys configured'));
   let lastError: unknown = null;
   for (let i = 0; i < GROQ_KEYS.length; i++) {
     try {
-      return await makeRequest(getGroqClientForKey(GROQ_KEYS[i]));
+      return await makeRequest(getGroqClient(GROQ_KEYS[i]));
     } catch (err) {
       lastError = err;
-      if (isExhaustedKeyError(err)) {
+      if (isRateLimitError(err)) {
         console.warn(`[groq] key #${i + 1} exhausted/invalid, trying next key...`);
         continue;
       }
-      throw err; // non-rate-limit error — no point trying other keys
+      throw err;
     }
   }
   throw new GroqAllKeysExhaustedError(lastError);
@@ -106,20 +91,28 @@ export interface AnalysisResponse {
   preparationRoadmap: PreparationRoadmap | null; createdAt: string; updatedAt: string;
 }
 
+export interface AnalysisTarget {
+  roles: string[];
+  customRole?: string;
+  company?: string;
+  jobDescription?: string;
+}
+
 // ─── Zod Schemas ──────────────────────────────────────────────────────────────
 
-const flexibleString = z.union([z.string(), z.number(), z.null()]).transform((v) => (v === null ? '' : String(v)));
+const flexStr = z.union([z.string(), z.number(), z.null()]).transform((v) => (v === null ? '' : String(v)));
 
 const CandidateProfileSchema = z.object({
   name: z.string(),
   email: z.string(),
   phone: z.string(),
   skills: z.array(z.string()),
-  education: z.array(z.object({ institution: z.string(), degree: z.string(), field: z.string(), startYear: flexibleString, endYear: flexibleString, gpa: flexibleString.optional() })),
-  experience: z.array(z.object({ company: z.string(), role: z.string(), startDate: flexibleString, endDate: flexibleString, description: z.string(), technologies: z.array(z.string()) })),
+  education: z.array(z.object({ institution: z.string(), degree: z.string(), field: z.string(), startYear: flexStr, endYear: flexStr, gpa: flexStr.optional() })),
+  experience: z.array(z.object({ company: z.string(), role: z.string(), startDate: flexStr, endDate: flexStr, description: z.string(), technologies: z.array(z.string()) })),
   projects: z.array(z.object({ name: z.string(), description: z.string(), technologies: z.array(z.string()), url: z.string().optional() })),
-  certifications: z.array(z.object({ name: z.string(), issuer: z.string(), year: flexibleString })),
+  certifications: z.array(z.object({ name: z.string(), issuer: z.string(), year: flexStr })),
 });
+
 const InterviewQuestionSchema = z.object({ question: z.string(), category: z.enum(['technical', 'project', 'scenario', 'hr']), difficulty: z.enum(['Easy', 'Medium', 'Hard']), hint: z.string() });
 const InterviewQuestionsSchema = z.object({ technical: z.array(InterviewQuestionSchema), project: z.array(InterviewQuestionSchema), scenario: z.array(InterviewQuestionSchema), hr: z.array(InterviewQuestionSchema) });
 const LearningResourceSchema = z.object({ skill: z.string(), name: z.string(), url: z.string(), platform: z.string(), type: z.enum(['free', 'paid', 'certification', 'practice']), description: z.string(), estimatedHours: z.number(), isCertification: z.boolean() });
@@ -128,15 +121,11 @@ const PreparationRoadmapSchema = z.object({
   weeks: z.array(z.object({ week: z.number(), title: z.string(), focus: z.string(), tasks: z.array(z.object({ day: z.number(), task: z.string(), resource: z.string().optional() })), skills: z.array(z.string()) })),
   tips: z.array(z.string()),
 });
+const SkillListSchema = z.object({ skills: z.array(z.string()) });
 
-// ─── Groq Text Helper (now with 3-key failover) ────────────────────────────────
+// ─── Groq Text Helper ─────────────────────────────────────────────────────────
 
-async function callGroq<T>(
-  systemPrompt: string,
-  userPrompt: string,
-  schema: z.ZodType<T>,
-  maxTokens = 1024,
-): Promise<T> {
+async function callGroq<T>(systemPrompt: string, userPrompt: string, schema: z.ZodType<T>, maxTokens = 1024): Promise<T> {
   const response = await withGroqFailover((client) =>
     client.chat.completions.create({
       model: GROQ_TEXT_MODEL,
@@ -156,9 +145,6 @@ async function callGroq<T>(
 }
 
 // ─── AI Services ──────────────────────────────────────────────────────────────
-// Every function below already has its own offline fallback for when Groq
-// fails (including GroqAllKeysExhaustedError, which is just another Error).
-// No changes were needed to these — they were already resilient by design.
 
 export async function extractResumeData(resumeText: string): Promise<CandidateProfile> {
   const truncated = resumeText.substring(0, 3500);
@@ -202,7 +188,6 @@ export async function generateCandidateSummary(profile: CandidateProfile, target
       z.object({ summary: z.string() }),
       256,
     );
-    // Always return a plain string — never the object itself
     return typeof result.summary === 'string' ? result.summary : String(result.summary);
   } catch (err) {
     console.error('[generateCandidateSummary] FAILED:', err);
@@ -248,11 +233,7 @@ export async function generateLearningResources(missingSkills: string[], targetR
   }
 }
 
-export async function generatePreparationRoadmap(
-  missingSkills: string[],
-  matchedSkills: string[],
-  targetRole: string,
-): Promise<PreparationRoadmap> {
+export async function generatePreparationRoadmap(missingSkills: string[], matchedSkills: string[], targetRole: string): Promise<PreparationRoadmap> {
   try {
     return await callGroq(
       `Create a 3-week preparation roadmap. Return ONLY JSON:
@@ -304,101 +285,56 @@ function isReadableText(text: string): boolean {
   if (text.length < 20) return false;
   const letters = (text.match(/[a-zA-Z]/g) || []).length;
   if (letters / text.length < 0.4) return false;
-  const wordMatches = text.match(/[a-zA-Z]{3,}/g) || [];
-  return wordMatches.length >= 10;
+  return (text.match(/[a-zA-Z]{3,}/g) || []).length >= 10;
 }
 
 // ─── PDF Parser ───────────────────────────────────────────────────────────────
-//
-// Fallback chain (in order):
-//   1. pdf-parse      — handles most standard PDFs including custom fonts
-//   2. pdfreader      — positional text extraction (original approach)
-//   3. raw extraction — brute-force PDF string scanning
-//   4. Groq vision    — renders the PDF as image and OCRs it via Llama 4 Scout
-//
-// Each step is tried silently; only the last throws to the caller.
+// Fallback chain: pdf-parse → pdfreader → raw extraction → Groq vision OCR
 
 export async function parseResumePDF(buffer: Buffer): Promise<string> {
-  // ── Step 1: pdf-parse (best general-purpose PDF text extractor) ──────────
   try {
     const text = await parsePDFWithPdfParse(buffer);
-    if (isReadableText(text)) {
-      console.log('[parseResumePDF] succeeded with pdf-parse, length:', text.length);
-      return text;
-    }
-    console.log('[parseResumePDF] pdf-parse returned unreadable text, trying pdfreader...');
-  } catch (e) {
-    console.log('[parseResumePDF] pdf-parse failed:', (e as Error).message, '— trying pdfreader...');
-  }
+    if (isReadableText(text)) { console.log('[parseResumePDF] pdf-parse success, length:', text.length); return text; }
+    console.log('[parseResumePDF] pdf-parse unreadable, trying pdfreader...');
+  } catch (e) { console.log('[parseResumePDF] pdf-parse failed:', (e as Error).message); }
 
-  // ── Step 2: pdfreader (positional row-based extraction) ──────────────────
   try {
     const text = await parsePDFWithPdfReader(buffer);
-    if (isReadableText(text)) {
-      console.log('[parseResumePDF] succeeded with pdfreader, length:', text.length);
-      return text;
-    }
-    console.log('[parseResumePDF] pdfreader returned unreadable text, trying raw extraction...');
-  } catch (e) {
-    console.log('[parseResumePDF] pdfreader failed:', (e as Error).message, '— trying raw extraction...');
-  }
+    if (isReadableText(text)) { console.log('[parseResumePDF] pdfreader success, length:', text.length); return text; }
+    console.log('[parseResumePDF] pdfreader unreadable, trying raw extraction...');
+  } catch (e) { console.log('[parseResumePDF] pdfreader failed:', (e as Error).message); }
 
-  // ── Step 3: raw PDF string scanning ─────────────────────────────────────
   try {
     const text = extractRawText(buffer);
-    if (isReadableText(text)) {
-      console.log('[parseResumePDF] succeeded with raw extraction, length:', text.length);
-      return text;
-    }
-    console.log('[parseResumePDF] raw extraction returned unreadable text, trying Groq vision OCR...');
-  } catch (e) {
-    console.log('[parseResumePDF] raw extraction failed:', (e as Error).message, '— trying Groq vision OCR...');
-  }
+    if (isReadableText(text)) { console.log('[parseResumePDF] raw extraction success, length:', text.length); return text; }
+    console.log('[parseResumePDF] raw extraction unreadable, trying Groq vision OCR...');
+  } catch (e) { console.log('[parseResumePDF] raw extraction failed:', (e as Error).message); }
 
-  // ── Step 4: Groq vision OCR (renders PDF pages as images) ───────────────
-  // Convert the first page of the PDF to a JPEG via sharp, then send to the
-  // Groq vision model. Requires: npm install sharp
-  // If sharp is not installed, this step is skipped gracefully.
   try {
     const text = await parsePDFWithGroqVision(buffer);
-    if (isReadableText(text)) {
-      console.log('[parseResumePDF] succeeded with Groq vision OCR, length:', text.length);
-      return text;
-    }
-  } catch (e) {
-    console.log('[parseResumePDF] Groq vision OCR failed:', (e as Error).message);
-  }
+    if (isReadableText(text)) { console.log('[parseResumePDF] Groq vision OCR success, length:', text.length); return text; }
+  } catch (e) { console.log('[parseResumePDF] Groq vision OCR failed:', (e as Error).message); }
 
   throw new Error(
     'Could not extract readable text from this PDF. ' +
     'It may use custom fonts, be scanned, or be image-only. ' +
-    'Please try: (1) re-saving it as a standard PDF, (2) uploading as DOCX or TXT, or (3) uploading a PNG/JPG screenshot of your resume.',
+    'Please try: (1) re-saving as standard PDF, (2) uploading as DOCX or TXT, or (3) uploading a PNG/JPG screenshot.',
   );
 }
 
-// ── pdf-parse: most compatible PDF text extractor ───────────────────────────
 async function parsePDFWithPdfParse(buffer: Buffer): Promise<string> {
-  // pdf-parse has a quirky export shape that breaks under Next.js/Turbopack's
-  // module resolution. We try all three known export shapes in order.
-  // Cast to `any` — pdf-parse ESM types don't expose `.default` but runtime does
   const mod = await import('pdf-parse') as any;
   const pdfParse: ((buf: Buffer, opts?: object) => Promise<{ text: string }>) | null =
     typeof mod.default?.default === 'function' ? mod.default.default :
       typeof mod.default === 'function' ? mod.default :
-        typeof mod === 'function' ? mod :
-          null;
+        typeof mod === 'function' ? mod : null;
   if (!pdfParse) throw new Error('pdfParse is not a function');
   const result = await pdfParse(buffer, { max: 0 });
-  const text = (result.text || '')
-    .replace(/\r\n/g, '\n')
-    .replace(/[ \t]{2,}/g, ' ')
-    .replace(/\n{3,}/g, '\n\n')
-    .trim();
+  const text = (result.text || '').replace(/\r\n/g, '\n').replace(/[ \t]{2,}/g, ' ').replace(/\n{3,}/g, '\n\n').trim();
   if (text.length < 20) throw new Error('pdf-parse extracted empty text');
   return text;
 }
 
-// ── pdfreader: positional row-based extraction ───────────────────────────────
 async function parsePDFWithPdfReader(buffer: Buffer): Promise<string> {
   const { PdfReader } = await import('pdfreader');
   return new Promise((resolve, reject) => {
@@ -425,7 +361,6 @@ async function parsePDFWithPdfReader(buffer: Buffer): Promise<string> {
   });
 }
 
-// ── Raw text: brute-force PDF string scanning ────────────────────────────────
 function extractRawText(buffer: Buffer): string {
   const content = buffer.toString('latin1');
   const matches = content.match(/\(([^\)]{2,})\)/g) || [];
@@ -438,11 +373,7 @@ function extractRawText(buffer: Buffer): string {
     .trim();
 }
 
-// ── Groq vision OCR: last-resort for scanned / image-only PDFs ──────────────
-// Requires: npm install sharp
-// sharp rasterizes PDF page 1 → PNG → Groq Llama 4 Scout OCR
 async function parsePDFWithGroqVision(buffer: Buffer): Promise<string> {
-  // sharp is required — raw PDF bytes are NOT valid image data for vision APIs
   let sharpLib: typeof import('sharp').default;
   try {
     sharpLib = (await import('sharp')).default;
@@ -452,14 +383,10 @@ async function parsePDFWithGroqVision(buffer: Buffer): Promise<string> {
 
   let imageBuffer: Buffer;
   try {
-    // density=150 gives ~1240x1754px for A4 — enough for OCR without being huge
     imageBuffer = await sharpLib(buffer, { density: 150 }).png().toBuffer();
-    console.log('[parsePDFWithGroqVision] rasterized PDF page 1 to PNG, size:', imageBuffer.length, 'bytes');
+    console.log('[parsePDFWithGroqVision] rasterized PDF to PNG, size:', imageBuffer.length);
   } catch (e) {
-    // sharp installed but PDF rasterization unsupported (libvips without poppler)
-    // Fall back to extracting the first embedded JPEG/PNG image from the PDF binary
-    console.log('[parsePDFWithGroqVision] PDF rasterization failed:', (e as Error).message);
-    console.log('[parsePDFWithGroqVision] trying embedded image extraction...');
+    console.log('[parsePDFWithGroqVision] PDF rasterization failed:', (e as Error).message, '— trying embedded image...');
     imageBuffer = await extractFirstEmbeddedImage(buffer, sharpLib);
   }
 
@@ -485,15 +412,9 @@ async function parsePDFWithGroqVision(buffer: Buffer): Promise<string> {
   return text;
 }
 
-// Extract the first JPEG/PNG image stream embedded in a PDF binary.
-// Used as a fallback when sharp cannot rasterize the PDF directly.
-async function extractFirstEmbeddedImage(
-  buffer: Buffer,
-  sharpLib: typeof import('sharp').default,
-): Promise<Buffer> {
+async function extractFirstEmbeddedImage(buffer: Buffer, sharpLib: typeof import('sharp').default): Promise<Buffer> {
   const bin = buffer.toString('binary');
 
-  // Try JPEG (most common in scanned PDFs)
   const jpegStart = bin.indexOf('\xFF\xD8\xFF');
   if (jpegStart !== -1) {
     const jpegEnd = bin.indexOf('\xFF\xD9', jpegStart);
@@ -504,7 +425,6 @@ async function extractFirstEmbeddedImage(
     }
   }
 
-  // Try PNG
   const pngSig = '\x89PNG\r\n\x1a\n';
   const pngStart = bin.indexOf(pngSig);
   if (pngStart !== -1) {
@@ -516,10 +436,7 @@ async function extractFirstEmbeddedImage(
     }
   }
 
-  throw new Error(
-    'sharp cannot rasterize this PDF and no embedded images were found. ' +
-    'Please upload the resume as a PNG or JPG screenshot instead.',
-  );
+  throw new Error('sharp cannot rasterize this PDF and no embedded images were found. Please upload as PNG or JPG instead.');
 }
 
 // ─── DOCX / TXT / Image Parsers ───────────────────────────────────────────────
@@ -569,7 +486,7 @@ export async function parseResumeImage(buffer: Buffer, filename: string, mimeTyp
     : (mimeType === 'image/webp' || ext === 'webp') ? 'image/webp'
       : 'image/jpeg';
 
-  console.log('[parseResumeImage] using model:', GROQ_VISION_MODEL, '| size:', buffer.length, 'bytes');
+  console.log('[parseResumeImage] model:', GROQ_VISION_MODEL, '| size:', buffer.length, 'bytes');
 
   const response = await withGroqFailover((client) =>
     client.chat.completions.create({
@@ -605,8 +522,6 @@ export async function parseResumeFile(buffer: Buffer, filename: string, mimeType
 }
 
 // ─── Skill Gap Analyzer ───────────────────────────────────────────────────────
-// Pure offline logic — no AI call involved, so it is unaffected by Groq
-// outages and serves as the natural "local fallback" for skill matching.
 
 function normalizeSkill(s: string): string { return s.toLowerCase().trim().replace(/[.\-_]/g, ' '); }
 
@@ -648,30 +563,13 @@ export function analyzeSkillGap(extractedSkills: string[], targetRole: string): 
   return { matchedSkills, missingSkills, recommendedSkills: recommendedMissing.slice(0, 5), readinessScore, totalRequired: roleData.requiredSkills.length };
 }
 
-// ─── Multi-Role / Custom Role / Job-Description-aware Target ─────────────────
-//
-// Lets the analyze screen support: multiple predefined roles selected at once,
-// a free-typed "other" role, a target company, and a pasted job description.
-// If a job description is supplied, its required skills are extracted via Groq
-// and merged into the comparison set — this is far more precise than matching
-// against the static ROLE_SKILLS list alone. If only a custom role is given
-// (no predefined roles, no JD), Groq is asked to infer typical required skills
-// for that role title.
-
-export interface AnalysisTarget {
-  roles: string[];          // predefined role ids the user toggled on (can be empty)
-  customRole?: string;      // free-typed role title, used if not in predefined list
-  company?: string;
-  jobDescription?: string;
-}
+// ─── Multi-Role / Custom Role / JD-aware Target ───────────────────────────────
 
 export function buildTargetRoleLabel(target: AnalysisTarget): string {
   const names = [...target.roles];
   if (target.customRole?.trim()) names.push(target.customRole.trim());
   return names.join(' / ') || 'Unspecified Role';
 }
-
-const SkillListSchema = z.object({ skills: z.array(z.string()) });
 
 export async function extractSkillsFromJobDescription(jobDescription: string): Promise<string[]> {
   if (!jobDescription || jobDescription.trim().length < 30) return [];
@@ -708,7 +606,7 @@ export async function analyzeSkillGapForTarget(
   extractedSkills: string[],
   target: AnalysisTarget,
 ): Promise<SkillGapResult & { targetRoleLabel: string }> {
-  const requiredMap = new Map<string, string>();   // normalized -> original casing
+  const requiredMap = new Map<string, string>();
   const recommendedMap = new Map<string, string>();
 
   for (const roleId of target.roles) {
@@ -724,7 +622,6 @@ export async function analyzeSkillGapForTarget(
     for (const s of jdSkills) requiredMap.set(normalizeSkill(s), s);
   }
 
-  // Only fall back to AI-inferred skills for the custom role if nothing else supplied any requirements
   if (target.customRole?.trim() && requiredMap.size === 0) {
     const inferred = await inferSkillsForCustomRole(target.customRole.trim());
     for (const s of inferred) requiredMap.set(normalizeSkill(s), s);
@@ -773,13 +670,18 @@ export function generatePDFReport(analysis: AnalysisResponse): Promise<Buffer> {
       doc.on('end', () => resolve(Buffer.concat(chunks)));
       doc.on('error', reject);
 
-      const PRIMARY = '#2563EB', SECONDARY = '#14B8A6', ACCENT = '#F59E0B', DARK = '#1E293B', MUTED = '#64748B', SUCCESS = '#10B981', DANGER = '#EF4444';
+      const PRIMARY = '#2563EB', SECONDARY = '#14B8A6', ACCENT = '#F59E0B',
+        DARK = '#1E293B', MUTED = '#64748B', SUCCESS = '#10B981', DANGER = '#EF4444';
 
+      // ── Header ──────────────────────────────────────────────────────────────
       doc.rect(0, 0, doc.page.width, 80).fill(PRIMARY);
       doc.fill('#FFFFFF').fontSize(28).font('Helvetica-Bold').text('ResumeIQ', 50, 20);
       doc.fontSize(11).font('Helvetica').text('AI-Powered Career Preparation Report', 50, 52);
       doc.rect(0, 80, doc.page.width, 4).fill(ACCENT);
-      doc.fill(MUTED).fontSize(9).text(`Generated: ${new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' })}`, doc.page.width - 200, 90, { width: 150, align: 'right' });
+      doc.fill(MUTED).fontSize(9).text(
+        `Generated: ${new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' })}`,
+        doc.page.width - 200, 90, { width: 150, align: 'right' },
+      );
       doc.moveDown(2);
 
       const sectionHeader = (title: string, color: string) => {
@@ -803,6 +705,7 @@ export function generatePDFReport(analysis: AnalysisResponse): Promise<Buffer> {
         return String(raw);
       })();
 
+      // ── Section 01: Candidate Profile ────────────────────────────────────
       sectionHeader('01  CANDIDATE PROFILE', PRIMARY);
       for (const [label, value] of [
         ['Name', analysis.candidateName || 'N/A'],
@@ -820,16 +723,20 @@ export function generatePDFReport(analysis: AnalysisResponse): Promise<Buffer> {
       }
       doc.moveDown(1);
 
+      // ── Section 02: Readiness Score ───────────────────────────────────────
+      checkPage(80);
       sectionHeader('02  READINESS SCORE', SECONDARY);
       const score = Math.round(analysis.readinessScore || 0);
       const scoreColor = score >= 70 ? SUCCESS : score >= 40 ? ACCENT : DANGER;
       doc.fill(scoreColor).fontSize(48).font('Helvetica-Bold').text(`${score}%`, 50, doc.y, { width: 100 });
       doc.fill(MUTED).fontSize(10).font('Helvetica').text(
         `${analysis.matchedSkills.length} of ${analysis.matchedSkills.length + analysis.missingSkills.length} required skills matched`,
-        150, doc.y - 14,
+        160, doc.y - 14,
       );
       doc.moveDown(2);
 
+      // ── Section 03: Skill Analysis ────────────────────────────────────────
+      checkPage(80);
       sectionHeader('03  SKILL ANALYSIS', PRIMARY);
       doc.fill(SUCCESS).fontSize(10).font('Helvetica-Bold').text('✓ Matched Skills:');
       doc.fill(DARK).font('Helvetica').fontSize(9).text(analysis.matchedSkills.join('  •  ') || 'None', { width: 495 });
@@ -838,21 +745,72 @@ export function generatePDFReport(analysis: AnalysisResponse): Promise<Buffer> {
       doc.fill(DARK).font('Helvetica').fontSize(9).text(analysis.missingSkills.join('  •  ') || 'None', { width: 495 });
       doc.moveDown(1);
 
+      // ── Section 04: Learning Recommendations ─────────────────────────────
       if (analysis.learningResources?.length > 0) {
-        checkPage(150);
+        checkPage(60);
         sectionHeader('04  LEARNING RECOMMENDATIONS', SECONDARY);
         for (const res of analysis.learningResources.slice(0, 12)) {
           checkPage(40);
           const typeLabel = res.type === 'free' ? '[FREE]' : res.type === 'paid' ? '[PAID]' : '[CERT]';
-          doc.fill(DARK).font('Helvetica').fontSize(9).text(`  ${typeLabel} ${res.name} — ${res.platform} (${res.skill})`, { width: 450 });
+          doc.fill(DARK).font('Helvetica').fontSize(9).text(
+            `  ${typeLabel} ${res.name} — ${res.platform} (${res.skill})`, { width: 450 },
+          );
         }
+        doc.moveDown(1);
       }
 
-      // ── Footer: "Page X of N" stamped on every page ───────────────────────
+      // ── Section 05: Education ─────────────────────────────────────────────
+      if (analysis.education?.length > 0) {
+        checkPage(60);
+        sectionHeader('05  EDUCATION', PRIMARY);
+        for (const edu of analysis.education) {
+          checkPage(40);
+          doc.fill(DARK).font('Helvetica-Bold').fontSize(10).text(`${edu.degree} in ${edu.field}`, { width: 495 });
+          doc.fill(MUTED).font('Helvetica').fontSize(9).text(`${edu.institution}  |  ${edu.startYear} – ${edu.endYear}${edu.gpa ? `  |  GPA: ${edu.gpa}` : ''}`);
+          doc.moveDown(0.5);
+        }
+        doc.moveDown(0.5);
+      }
+
+      // ── Section 06: Experience ────────────────────────────────────────────
+      if (analysis.experience?.length > 0) {
+        checkPage(60);
+        sectionHeader('06  WORK EXPERIENCE', SECONDARY);
+        for (const exp of analysis.experience) {
+          checkPage(60);
+          doc.fill(DARK).font('Helvetica-Bold').fontSize(10).text(`${exp.role} @ ${exp.company}`, { width: 495 });
+          doc.fill(MUTED).font('Helvetica').fontSize(9).text(`${exp.startDate} – ${exp.endDate}`);
+          doc.fill(DARK).font('Helvetica').fontSize(9).text(exp.description, { width: 495 });
+          if (exp.technologies?.length > 0) {
+            doc.fill(MUTED).fontSize(8).text(`Tech: ${exp.technologies.join(', ')}`, { width: 495 });
+          }
+          doc.moveDown(0.5);
+        }
+        doc.moveDown(0.5);
+      }
+
+      // ── Section 07: Projects ──────────────────────────────────────────────
+      if (analysis.projects?.length > 0) {
+        checkPage(60);
+        sectionHeader('07  PROJECTS', PRIMARY);
+        for (const proj of analysis.projects) {
+          checkPage(50);
+          doc.fill(DARK).font('Helvetica-Bold').fontSize(10).text(proj.name, { width: 495 });
+          doc.fill(DARK).font('Helvetica').fontSize(9).text(proj.description, { width: 495 });
+          if (proj.technologies?.length > 0) {
+            doc.fill(MUTED).fontSize(8).text(`Tech: ${proj.technologies.join(', ')}`, { width: 495 });
+          }
+          if (proj.url) doc.fill(PRIMARY).fontSize(8).text(proj.url, { width: 495 });
+          doc.moveDown(0.5);
+        }
+        doc.moveDown(0.5);
+      }
+
+      // ── Footer: Page X of N on every page ────────────────────────────────
       const { start, count } = doc.bufferedPageRange();
       for (let i = 0; i < count; i++) {
         doc.switchToPage(start + i);
-        const footerY = doc.page.height - 50 + 10;
+        const footerY = doc.page.height - 40;
         doc.moveTo(50, footerY - 4).lineTo(doc.page.width - 50, footerY - 4).lineWidth(0.5).strokeColor('#cccccc').stroke();
         doc.font('Helvetica').fontSize(9).fillColor(MUTED).text(
           `Page ${i + 1} of ${count}`,
@@ -861,8 +819,8 @@ export function generatePDFReport(analysis: AnalysisResponse): Promise<Buffer> {
         );
       }
       doc.flushPages();
-
       doc.end();
+
     } catch (error) { reject(error); }
   });
 }
@@ -870,7 +828,7 @@ export function generatePDFReport(analysis: AnalysisResponse): Promise<Buffer> {
 // ─── CSV Report Generator ─────────────────────────────────────────────────────
 
 export function generateCSVReport(analysis: AnalysisResponse): string {
-  const escCSV = (v: string) => (v.includes(',') || v.includes('"') || v.includes('\n')) ? `"${v.replace(/"/g, '""')}"` : v;
+  const esc = (v: string) => (v.includes(',') || v.includes('"') || v.includes('\n')) ? `"${v.replace(/"/g, '""')}"` : v;
   const rows: string[][] = [
     ['ResumeIQ — Skills Analysis Report'], [],
     ['Candidate', analysis.candidateName || 'N/A'],
@@ -883,5 +841,5 @@ export function generateCSVReport(analysis: AnalysisResponse): string {
   for (const s of analysis.missingSkills) rows.push([s, 'Missing', 'High']);
   rows.push([], ['Learning Resources'], ['Skill', 'Resource', 'Platform', 'Type', 'URL', 'Hours']);
   for (const r of analysis.learningResources || []) rows.push([r.skill, r.name, r.platform, r.type, r.url, String(r.estimatedHours)]);
-  return rows.map((row) => row.map(escCSV).join(',')).join('\n');
+  return rows.map((row) => row.map(esc).join(',')).join('\n');
 }
