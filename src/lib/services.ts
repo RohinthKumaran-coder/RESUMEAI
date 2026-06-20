@@ -16,15 +16,70 @@ import type { SupportedRole } from './role-skills';
 const GROQ_TEXT_MODEL = 'llama-3.3-70b-versatile';
 const GROQ_VISION_MODEL = 'meta-llama/llama-4-scout-17b-16e-instruct';
 
-let _groqClient: OpenAI | null = null;
-function getGroqClient(): OpenAI {
-  if (!_groqClient) {
-    _groqClient = new OpenAI({
-      apiKey: process.env.GROQ_API_KEY ?? '',
-      baseURL: 'https://api.groq.com/openai/v1',
-    });
+// ─── Groq Key Pool + Failover ──────────────────────────────────────────────────
+//
+// 3 keys tried in order on every callGroq() invocation. A key is skipped to
+// the next one on 429 (rate limit) / 401 / 403 (invalid/exhausted). Any other
+// error (bad request, network) aborts immediately — retrying other keys won't
+// help. If ALL 3 keys are exhausted, callGroq() throws GroqAllKeysExhaustedError,
+// which every caller below already catches and falls back to its own offline
+// fallback (hardcoded fallback questions, empty profile, local skill match, etc).
+
+const GROQ_KEYS = [
+  process.env.GROQ_API_KEY_1,
+  process.env.GROQ_API_KEY_2,
+  process.env.GROQ_API_KEY_3,
+].filter((k): k is string => typeof k === 'string' && k.trim().length > 0);
+
+if (GROQ_KEYS.length === 0) {
+  console.warn('[groq] No GROQ_API_KEY_1/2/3 configured — all AI calls will go straight to local fallback.');
+}
+
+const _groqClients = new Map<string, OpenAI>();
+function getGroqClientForKey(key: string): OpenAI {
+  let client = _groqClients.get(key);
+  if (!client) {
+    client = new OpenAI({ apiKey: key, baseURL: 'https://api.groq.com/openai/v1' });
+    _groqClients.set(key, client);
   }
-  return _groqClient;
+  return client;
+}
+
+function isExhaustedKeyError(err: unknown): boolean {
+  const status =
+    (err as any)?.status ??
+    (err as any)?.response?.status ??
+    (err as any)?.statusCode;
+  return status === 429 || status === 401 || status === 403;
+}
+
+export class GroqAllKeysExhaustedError extends Error {
+  constructor(public cause: unknown) {
+    super('All Groq API keys are rate-limited or exhausted.');
+    this.name = 'GroqAllKeysExhaustedError';
+  }
+}
+
+/** Runs `makeRequest` against each configured Groq key in order until one succeeds. */
+async function withGroqFailover<T>(makeRequest: (client: OpenAI) => Promise<T>): Promise<T> {
+  if (GROQ_KEYS.length === 0) {
+    throw new GroqAllKeysExhaustedError(new Error('No Groq keys configured'));
+  }
+
+  let lastError: unknown = null;
+  for (let i = 0; i < GROQ_KEYS.length; i++) {
+    try {
+      return await makeRequest(getGroqClientForKey(GROQ_KEYS[i]));
+    } catch (err) {
+      lastError = err;
+      if (isExhaustedKeyError(err)) {
+        console.warn(`[groq] key #${i + 1} exhausted/invalid, trying next key...`);
+        continue;
+      }
+      throw err; // non-rate-limit error — no point trying other keys
+    }
+  }
+  throw new GroqAllKeysExhaustedError(lastError);
 }
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -74,7 +129,7 @@ const PreparationRoadmapSchema = z.object({
   tips: z.array(z.string()),
 });
 
-// ─── Groq Text Helper ─────────────────────────────────────────────────────────
+// ─── Groq Text Helper (now with 3-key failover) ────────────────────────────────
 
 async function callGroq<T>(
   systemPrompt: string,
@@ -82,17 +137,18 @@ async function callGroq<T>(
   schema: z.ZodType<T>,
   maxTokens = 1024,
 ): Promise<T> {
-  const client = getGroqClient();
-  const response = await client.chat.completions.create({
-    model: GROQ_TEXT_MODEL,
-    max_tokens: maxTokens,
-    temperature: 0.3,
-    response_format: { type: 'json_object' },
-    messages: [
-      { role: 'system', content: systemPrompt },
-      { role: 'user', content: userPrompt },
-    ],
-  });
+  const response = await withGroqFailover((client) =>
+    client.chat.completions.create({
+      model: GROQ_TEXT_MODEL,
+      max_tokens: maxTokens,
+      temperature: 0.3,
+      response_format: { type: 'json_object' },
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt },
+      ],
+    })
+  );
   const text = response.choices[0]?.message?.content ?? '';
   if (!text) throw new Error('Empty response from Groq');
   const cleaned = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
@@ -100,6 +156,9 @@ async function callGroq<T>(
 }
 
 // ─── AI Services ──────────────────────────────────────────────────────────────
+// Every function below already has its own offline fallback for when Groq
+// fails (including GroqAllKeysExhaustedError, which is just another Error).
+// No changes were needed to these — they were already resilient by design.
 
 export async function extractResumeData(resumeText: string): Promise<CandidateProfile> {
   const truncated = resumeText.substring(0, 3500);
@@ -405,19 +464,20 @@ async function parsePDFWithGroqVision(buffer: Buffer): Promise<string> {
   }
 
   const base64 = imageBuffer.toString('base64');
-  const client = getGroqClient();
-  const response = await client.chat.completions.create({
-    model: GROQ_VISION_MODEL,
-    max_tokens: 2048,
-    temperature: 0.1,
-    messages: [{
-      role: 'user',
-      content: [
-        { type: 'image_url', image_url: { url: `data:image/png;base64,${base64}` } },
-        { type: 'text', text: 'This is a resume. Extract ALL text exactly as it appears — name, contact info, education, work experience, skills, projects, certifications. Preserve structure. Output ONLY the extracted text, no commentary.' },
-      ],
-    }],
-  });
+  const response = await withGroqFailover((client) =>
+    client.chat.completions.create({
+      model: GROQ_VISION_MODEL,
+      max_tokens: 2048,
+      temperature: 0.1,
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'image_url', image_url: { url: `data:image/png;base64,${base64}` } },
+          { type: 'text', text: 'This is a resume. Extract ALL text exactly as it appears — name, contact info, education, work experience, skills, projects, certifications. Preserve structure. Output ONLY the extracted text, no commentary.' },
+        ],
+      }],
+    })
+  );
 
   const text = (response.choices[0]?.message?.content ?? '').trim();
   if (text.length < 20) throw new Error('Groq vision OCR returned empty text');
@@ -511,19 +571,20 @@ export async function parseResumeImage(buffer: Buffer, filename: string, mimeTyp
 
   console.log('[parseResumeImage] using model:', GROQ_VISION_MODEL, '| size:', buffer.length, 'bytes');
 
-  const client = getGroqClient();
-  const response = await client.chat.completions.create({
-    model: GROQ_VISION_MODEL,
-    max_tokens: 2048,
-    temperature: 0.2,
-    messages: [{
-      role: 'user',
-      content: [
-        { type: 'image_url', image_url: { url: `data:${mediaType};base64,${buffer.toString('base64')}` } },
-        { type: 'text', text: 'Extract all readable text from this resume image, preserving structure as plain text. Output ONLY the extracted text — no commentary, no markdown.' },
-      ],
-    }],
-  });
+  const response = await withGroqFailover((client) =>
+    client.chat.completions.create({
+      model: GROQ_VISION_MODEL,
+      max_tokens: 2048,
+      temperature: 0.2,
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'image_url', image_url: { url: `data:${mediaType};base64,${buffer.toString('base64')}` } },
+          { type: 'text', text: 'Extract all readable text from this resume image, preserving structure as plain text. Output ONLY the extracted text — no commentary, no markdown.' },
+        ],
+      }],
+    })
+  );
 
   const text = (response.choices[0]?.message?.content ?? '').trim();
   if (text.length < 20) throw new Error('Could not extract text from this image. Try a clearer photo.');
@@ -544,6 +605,8 @@ export async function parseResumeFile(buffer: Buffer, filename: string, mimeType
 }
 
 // ─── Skill Gap Analyzer ───────────────────────────────────────────────────────
+// Pure offline logic — no AI call involved, so it is unaffected by Groq
+// outages and serves as the natural "local fallback" for skill matching.
 
 function normalizeSkill(s: string): string { return s.toLowerCase().trim().replace(/[.\-_]/g, ' '); }
 
@@ -704,7 +767,7 @@ export async function analyzeSkillGapForTarget(
 export function generatePDFReport(analysis: AnalysisResponse): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     try {
-      const doc = new PDFDocument({ margin: 50, size: 'A4' });
+      const doc = new PDFDocument({ margin: 50, size: 'A4', bufferPages: true });
       const chunks: Buffer[] = [];
       doc.on('data', (chunk: Buffer) => chunks.push(chunk));
       doc.on('end', () => resolve(Buffer.concat(chunks)));
@@ -784,6 +847,21 @@ export function generatePDFReport(analysis: AnalysisResponse): Promise<Buffer> {
           doc.fill(DARK).font('Helvetica').fontSize(9).text(`  ${typeLabel} ${res.name} — ${res.platform} (${res.skill})`, { width: 450 });
         }
       }
+
+      // ── Footer: "Page X of N" stamped on every page ───────────────────────
+      const { start, count } = doc.bufferedPageRange();
+      for (let i = 0; i < count; i++) {
+        doc.switchToPage(start + i);
+        const footerY = doc.page.height - 50 + 10;
+        doc.moveTo(50, footerY - 4).lineTo(doc.page.width - 50, footerY - 4).lineWidth(0.5).strokeColor('#cccccc').stroke();
+        doc.font('Helvetica').fontSize(9).fillColor(MUTED).text(
+          `Page ${i + 1} of ${count}`,
+          50, footerY,
+          { width: doc.page.width - 100, align: 'center' },
+        );
+      }
+      doc.flushPages();
+
       doc.end();
     } catch (error) { reject(error); }
   });
