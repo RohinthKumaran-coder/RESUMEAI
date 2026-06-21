@@ -61,15 +61,47 @@ export const analysisApi = {
     targetCompany?: string,
     jobDescription?: string
   ) => {
+    console.log('[api:analysisApi:create] Initiating analysis creation.');
+    console.log(`[api:analysisApi:create] File info:`, {
+      name: file.name,
+      size: file.size,
+      type: file.type
+    });
+    console.log(`[api:analysisApi:create] Parameters:`, {
+      roles,
+      customRole,
+      targetCompany,
+      jobDescription
+    });
+
+    // Try reading file content on the client side to avoid Android Content Provider permission issues.
+    let safeFile: File = file;
+    try {
+      console.log('[api:analysisApi:create] Reading file locally to byte array...');
+      const buffer = await file.arrayBuffer();
+      console.log(`[api:analysisApi:create] Successfully read ${buffer.byteLength} bytes.`);
+      const blob = new Blob([buffer], { type: file.type || 'application/octet-stream' });
+      safeFile = new File([blob], file.name, { type: file.type || 'application/octet-stream' });
+    } catch (readErr: any) {
+      console.error('[api:analysisApi:create] Client-side file read failed:', readErr);
+      throw new Error(`Failed to read resume file: ${readErr.message || 'Permission denied'}. Please re-select the file or use a local file instead of a cloud storage link.`);
+    }
+
     const formData = new FormData();
-    formData.append('resume', file);
+    formData.append('resume', safeFile);
     formData.append('targetRoles', JSON.stringify(roles));
     if (customRole) formData.append('customRole', customRole);
     if (targetCompany) formData.append('targetCompany', targetCompany);
     if (jobDescription) formData.append('jobDescription', jobDescription);
-    const { data } = await api.post<{ success: boolean; data: Analysis }>('/analysis', formData, {
-      headers: { 'Content-Type': 'multipart/form-data' },
-    });
+
+    console.log('[api:analysisApi:create] Sending POST /analysis request via axios.');
+    
+    // CRITICAL BUG FIX: Remove manual 'Content-Type': 'multipart/form-data' header.
+    // If manually set, Axios deletes the boundary boundary value parameters in the header,
+    // which causes the server side to throw a parsing error or disconnect the request.
+    const { data } = await api.post<{ success: boolean; data: Analysis }>('/analysis', formData);
+    
+    console.log('[api:analysisApi:create] POST /analysis success:', data);
     return data.data;
   },
 

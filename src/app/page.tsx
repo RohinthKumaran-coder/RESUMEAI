@@ -111,19 +111,49 @@ const useStore = create<AppState>((set) => ({
 // ═══════════════════════════════════════════════════════════════════════════════
 
 async function api(path: string, opts: RequestInit = {}) {
-  const token = localStorage.getItem('token');
-  const headers: Record<string, string> = {};
-  if (token) headers['Authorization'] = `Bearer ${token}`;
-  if (!(opts.body instanceof FormData)) headers['Content-Type'] = 'application/json';
-  const res = await fetch(`/api${path}`, { ...opts, headers: { ...headers, ...opts.headers as Record<string, string> } });
-  if (path.includes('/export/pdf')) return res;
-
-  const text = await res.text();
   try {
-    return JSON.parse(text);
-  } catch {
-    console.error(`API ${path} returned non-JSON (status ${res.status}):`, text.slice(0, 500));
-    return { success: false, message: `Server error (${res.status}). Check Vercel logs for details.` };
+    console.log(`[api] Initiating request to: /api${path}`);
+    let token = null;
+    try {
+      token = localStorage.getItem('token');
+      console.log(`[api] Local token retrieved: ${token ? 'Found' : 'Not found'}`);
+    } catch (tokenErr) {
+      console.error('[api] Failed to retrieve token from localStorage:', tokenErr);
+    }
+    const headers: Record<string, string> = {};
+    if (token) headers['Authorization'] = `Bearer ${token}`;
+    if (!(opts.body instanceof FormData)) headers['Content-Type'] = 'application/json';
+
+    console.log(`[api] Request options:`, {
+      method: opts.method || 'GET',
+      headers: { ...headers, ...opts.headers },
+      hasBody: !!opts.body,
+      bodyType: opts.body ? opts.body.constructor.name : 'none',
+    });
+
+    const res = await fetch(`/api${path}`, {
+      ...opts,
+      headers: { ...headers, ...opts.headers as Record<string, string> }
+    });
+
+    console.log(`[api] Response status: ${res.status} ${res.statusText}`);
+
+    if (path.includes('/export/pdf')) return res;
+
+    const text = await res.text();
+    console.log(`[api] Raw response text preview:`, text.slice(0, 200));
+
+    try {
+      const parsed = JSON.parse(text);
+      console.log(`[api] Parsed JSON response successfully:`, parsed);
+      return parsed;
+    } catch (parseErr) {
+      console.error(`API ${path} returned non-JSON (status ${res.status}):`, text.slice(0, 500), parseErr);
+      return { success: false, message: `Server error (${res.status}). Check Vercel logs for details.` };
+    }
+  } catch (netErr: any) {
+    console.error(`[api] Network error or fetch exception for path ${path}:`, netErr);
+    throw netErr;
   }
 }
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -557,28 +587,70 @@ function Analyze() {
   const hasTarget = selectedRoles.length > 0 || (useCustomRole && customRole.trim().length > 0);
 
   const handleSubmit = async () => {
-    if (!file || !hasTarget) { setToast({ message: 'Please select a file and at least one target role.', type: 'error' }); return; }
+    console.log('[Analyze:handleSubmit] Button clicked.');
+    if (!file || !hasTarget) {
+      console.warn('[Analyze:handleSubmit] Validation failed: file or target role missing.');
+      setToast({ message: 'Please select a file and at least one target role.', type: 'error' });
+      return;
+    }
     setLoading(true);
     setProgress('Uploading resume...');
     try {
+      console.log(`[Analyze:handleSubmit] Selected File properties:`, {
+        name: file.name,
+        size: file.size,
+        type: file.type,
+        lastModified: file.lastModified
+      });
+      console.log(`[Analyze:handleSubmit] Targets:`, {
+        selectedRoles,
+        useCustomRole,
+        customRole,
+        targetCompany,
+        jobDescription
+      });
+
+      // Try reading the file stream on the client side first to detect & resolve mobile sandbox/content-URI access bugs.
+      let safeFile: File = file;
+      try {
+        console.log('[Analyze:handleSubmit] Reading file buffer on client side...');
+        const buffer = await file.arrayBuffer();
+        console.log(`[Analyze:handleSubmit] Successfully read ${buffer.byteLength} bytes into memory.`);
+        const blob = new Blob([buffer], { type: file.type || 'application/octet-stream' });
+        safeFile = new File([blob], file.name, { type: file.type || 'application/octet-stream' });
+      } catch (readErr: any) {
+        console.error('[Analyze:handleSubmit] Failed to read file contents client-side:', readErr);
+        throw new Error(`Could not access file data: ${readErr.message || 'Permission denied'}. Please re-select the file or use a local file instead of a cloud storage link.`);
+      }
+
       const formData = new FormData();
-      formData.append('resume', file);
+      formData.append('resume', safeFile);
       formData.append('targetRoles', JSON.stringify(selectedRoles));
       if (useCustomRole && customRole.trim()) formData.append('customRole', customRole.trim());
       if (targetCompany.trim()) formData.append('targetCompany', targetCompany.trim());
       if (jobDescription.trim()) formData.append('jobDescription', jobDescription.trim());
+
+      console.log('[Analyze:handleSubmit] FormData payload prepared.');
       setProgress('AI is analyzing your resume...');
+
       const data = await api('/analysis', { method: 'POST', body: formData });
+      console.log('[Analyze:handleSubmit] API call returned response:', data);
+
       if (data.success) {
         setActiveAnalysis(data.data);
         setAnalyses([data.data, ...analyses]);
         setToast({ message: 'Analysis complete!', type: 'success' });
         go('detail');
       } else {
+        console.warn('[Analyze:handleSubmit] API returned success=false:', data.message);
         setToast({ message: data.message || 'Analysis failed.', type: 'error' });
       }
-    } catch { setToast({ message: 'Network error.', type: 'error' }); }
-    setLoading(false); setProgress('');
+    } catch (err: any) {
+      console.error('[Analyze:handleSubmit] Exception caught during submit pipeline:', err);
+      setToast({ message: err.message || 'Network error.', type: 'error' });
+    }
+    setLoading(false);
+    setProgress('');
   };
 
   return (
