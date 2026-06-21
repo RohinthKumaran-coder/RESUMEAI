@@ -1,9 +1,9 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
-    // Keep these packages as native require() — do NOT bundle them.
-    // pdfkit reads font .afm files from disk at runtime; bundling strips them → blank PDF.
-    // pdf-parse, mammoth, pdfreader also rely on native Node.js file system access.
-    serverExternalPackages: ['pdfkit', 'pdf-parse', 'mammoth', 'pdfreader', 'sharp'],
+    // Keep these as native require() — do NOT bundle them.
+    // pdf-parse, mammoth, pdfreader rely on Node.js file system access.
+    // pdfkit is NO LONGER USED — replaced by pdf-lib (pure JS, Vercel-safe).
+    serverExternalPackages: ['pdf-parse', 'mammoth', 'pdfreader', 'sharp'],
 };
 
 module.exports = nextConfig;
