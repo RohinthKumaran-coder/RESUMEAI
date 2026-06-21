@@ -56,22 +56,14 @@ const K = {
 
 function hydrateUser(raw: unknown): UserRecord | null {
   if (!raw || typeof raw !== 'object') return null;
-  const r = raw as Record<string, unknown>;
-  return {
-    ...(r as UserRecord),
-    createdAt: new Date(r.createdAt as string),
-    updatedAt: new Date(r.updatedAt as string),
-  };
+  const r = raw as unknown as UserRecord & { createdAt: string; updatedAt: string };
+  return { ...r, createdAt: new Date(r.createdAt), updatedAt: new Date(r.updatedAt) };
 }
 
 function hydrateAnalysis(raw: unknown): AnalysisRecord | null {
   if (!raw || typeof raw !== 'object') return null;
-  const r = raw as Record<string, unknown>;
-  return {
-    ...(r as AnalysisRecord),
-    createdAt: new Date(r.createdAt as string),
-    updatedAt: new Date(r.updatedAt as string),
-  };
+  const r = raw as unknown as AnalysisRecord & { createdAt: string; updatedAt: string };
+  return { ...r, createdAt: new Date(r.createdAt), updatedAt: new Date(r.updatedAt) };
 }
 
 // ─── DB interface ─────────────────────────────────────────────────────────────
