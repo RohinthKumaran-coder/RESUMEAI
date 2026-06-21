@@ -117,9 +117,15 @@ async function api(path: string, opts: RequestInit = {}) {
   if (!(opts.body instanceof FormData)) headers['Content-Type'] = 'application/json';
   const res = await fetch(`/api${path}`, { ...opts, headers: { ...headers, ...opts.headers as Record<string, string> } });
   if (path.includes('/export/pdf')) return res;
-  return res.json();
-}
 
+  const text = await res.text();
+  try {
+    return JSON.parse(text);
+  } catch {
+    console.error(`API ${path} returned non-JSON (status ${res.status}):`, text.slice(0, 500));
+    return { success: false, message: `Server error (${res.status}). Check Vercel logs for details.` };
+  }
+}
 // ═══════════════════════════════════════════════════════════════════════════════
 // MAIN PAGE
 // ═══════════════════════════════════════════════════════════════════════════════
