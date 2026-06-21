@@ -69,9 +69,10 @@ async function handleRegister(req: NextRequest) {
   const { email, password, name } = await req.json();
   if (!email || !password) return err('Email and password are required.', 400);
   if (password.length < 6) return err('Password must be at least 6 characters.', 400);
-  if (db.user.findByEmail(email)) return err('An account with this email already exists.', 409);
+  const existing = await db.user.findByEmail(email);
+  if (existing) return err('An account with this email already exists.', 409);
   const hashed = await bcrypt.hash(password, 10);
-  const user = db.user.create({ email, password: hashed, name: name || null });
+  const user = await db.user.create({ email, password: hashed, name: name || null });
   const token = signToken(user.id, user.email);
   return json({ success: true, token, user: { id: user.id, email: user.email, name: user.name, avatar: user.avatar, createdAt: user.createdAt } }, 201);
 }
@@ -79,17 +80,17 @@ async function handleRegister(req: NextRequest) {
 async function handleLogin(req: NextRequest) {
   const { email, password } = await req.json();
   if (!email || !password) return err('Email and password are required.', 400);
-  const user = db.user.findByEmail(email);
+  const user = await db.user.findByEmail(email);
   if (!user) return err('Invalid email or password.', 401);
   const isMatch = await bcrypt.compare(password, user.password);
   if (!isMatch) return err('Invalid email or password.', 401);
   return json({ success: true, token: signToken(user.id, user.email), user: { id: user.id, email: user.email, name: user.name, avatar: user.avatar } });
 }
 
-function handleGetMe(req: NextRequest) {
+async function handleGetMe(req: NextRequest) {
   const auth = verifyAuth(req);
   if (!auth) return err('Not authenticated.', 401);
-  const user = db.user.findById(auth.userId);
+  const user = await db.user.findById(auth.userId);
   if (!user) return err('User not found.', 404);
   return json({ success: true, data: { id: user.id, email: user.email, name: user.name, avatar: user.avatar, createdAt: user.createdAt } });
 }
@@ -103,7 +104,6 @@ async function handleCreateAnalysis(req: NextRequest) {
   const formData = await req.formData();
   const file = formData.get('resume') as File | null;
 
-  // Multi-role targeting fields (replaces the old single `targetRole` field)
   const targetRolesRaw = formData.get('targetRoles') as string | null;
   const customRole = (formData.get('customRole') as string | null)?.trim() || undefined;
   const targetCompany = (formData.get('targetCompany') as string | null)?.trim() || undefined;
@@ -133,7 +133,6 @@ async function handleCreateAnalysis(req: NextRequest) {
     return err('File too large. Max size is 10MB.', 400);
   }
 
-  // Parse file → extract profile → skill gap (all non-Claude except image OCR, run first)
   const buffer = Buffer.from(await file.arrayBuffer());
   let resumeText: string;
   try {
@@ -144,13 +143,10 @@ async function handleCreateAnalysis(req: NextRequest) {
 
   const profile = await extractResumeData(resumeText);
 
-  // Build AnalysisTarget and use the async, multi-source skill gap
-  // (merges predefined role skills + JD-extracted skills + inferred custom-role skills)
   const target: AnalysisTarget = { roles, customRole, company: targetCompany, jobDescription };
   const skillGap = await analyzeSkillGapForTarget(profile.skills, target);
   const targetRoleLabel = skillGap.targetRoleLabel;
 
-  // All 4 Claude calls run in parallel — saves ~3x time vs sequential
   const [summary, resources, questions, roadmap] = await Promise.allSettled([
     generateCandidateSummary(profile, targetRoleLabel),
     generateLearningResources(skillGap.missingSkills, targetRoleLabel),
@@ -158,7 +154,7 @@ async function handleCreateAnalysis(req: NextRequest) {
     generatePreparationRoadmap(skillGap.missingSkills, skillGap.matchedSkills, targetRoleLabel),
   ]);
 
-  const analysis = db.analysis.create({
+  const analysis = await db.analysis.create({
     userId: auth.userId, targetRole: targetRoleLabel, resumeFileName: file.name, resumeText,
     candidateName: profile.name,
     candidateEmail: profile.email,
@@ -180,35 +176,36 @@ async function handleCreateAnalysis(req: NextRequest) {
   return json({ success: true, data: shapeAnalysis(analysis), message: 'Resume analyzed successfully!' }, 201);
 }
 
-function handleListAnalyses(req: NextRequest) {
+async function handleListAnalyses(req: NextRequest) {
   const auth = verifyAuth(req);
   if (!auth) return err('Not authenticated.', 401);
-  return json({ success: true, data: db.analysis.findByUser(auth.userId).map(shapeAnalysis) });
+  const analyses = await db.analysis.findByUser(auth.userId);
+  return json({ success: true, data: analyses.map(shapeAnalysis) });
 }
 
-function handleGetAnalysis(req: NextRequest, id: string) {
+async function handleGetAnalysis(req: NextRequest, id: string) {
   const auth = verifyAuth(req);
   if (!auth) return err('Not authenticated.', 401);
-  const analysis = db.analysis.findById(id);
+  const analysis = await db.analysis.findById(id);
   if (!analysis) return err('Analysis not found.', 404);
   if (analysis.userId !== auth.userId) return err('Not authorized.', 403);
   return json({ success: true, data: shapeAnalysis(analysis) });
 }
 
-function handleDeleteAnalysis(req: NextRequest, id: string) {
+async function handleDeleteAnalysis(req: NextRequest, id: string) {
   const auth = verifyAuth(req);
   if (!auth) return err('Not authenticated.', 401);
-  const analysis = db.analysis.findById(id);
+  const analysis = await db.analysis.findById(id);
   if (!analysis) return err('Analysis not found.', 404);
   if (analysis.userId !== auth.userId) return err('Not authorized.', 403);
-  db.analysis.delete(id);
+  await db.analysis.delete(id);
   return json({ success: true, message: 'Analysis deleted successfully.' });
 }
 
 async function handleGenerateQuestions(req: NextRequest, id: string) {
   const auth = verifyAuth(req);
   if (!auth) return err('Not authenticated.', 401);
-  const analysis = db.analysis.findById(id);
+  const analysis = await db.analysis.findById(id);
   if (!analysis) return err('Analysis not found.', 404);
   if (analysis.userId !== auth.userId) return err('Not authorized.', 403);
 
@@ -221,25 +218,25 @@ async function handleGenerateQuestions(req: NextRequest, id: string) {
     certifications: (analysis.certifications as AnalysisResponse['certifications']) || [],
   };
   const questions = await generateInterviewQuestions(profile, analysis.targetRole, analysis.matchedSkills, analysis.missingSkills);
-  const updated = db.analysis.update(id, { interviewQuestions: questions });
+  const updated = await db.analysis.update(id, { interviewQuestions: questions });
   return json({ success: true, data: shapeAnalysis(updated!) });
 }
 
 async function handleGenerateRoadmap(req: NextRequest, id: string) {
   const auth = verifyAuth(req);
   if (!auth) return err('Not authenticated.', 401);
-  const analysis = db.analysis.findById(id);
+  const analysis = await db.analysis.findById(id);
   if (!analysis) return err('Analysis not found.', 404);
   if (analysis.userId !== auth.userId) return err('Not authorized.', 403);
   const roadmap = await generatePreparationRoadmap(analysis.missingSkills, analysis.matchedSkills, analysis.targetRole);
-  const updated = db.analysis.update(id, { preparationRoadmap: roadmap });
+  const updated = await db.analysis.update(id, { preparationRoadmap: roadmap });
   return json({ success: true, data: shapeAnalysis(updated!) });
 }
 
 async function handleExportPDF(req: NextRequest, id: string) {
   const auth = verifyAuth(req);
   if (!auth) return err('Not authenticated.', 401);
-  const analysis = db.analysis.findById(id);
+  const analysis = await db.analysis.findById(id);
   if (!analysis) return err('Analysis not found.', 404);
   if (analysis.userId !== auth.userId) return err('Not authorized.', 403);
   const pdfBuffer = await generatePDFReport(shapeAnalysis(analysis));
@@ -253,10 +250,10 @@ async function handleExportPDF(req: NextRequest, id: string) {
   });
 }
 
-function handleExportCSV(req: NextRequest, id: string) {
+async function handleExportCSV(req: NextRequest, id: string) {
   const auth = verifyAuth(req);
   if (!auth) return err('Not authenticated.', 401);
-  const analysis = db.analysis.findById(id);
+  const analysis = await db.analysis.findById(id);
   if (!analysis) return err('Analysis not found.', 404);
   if (analysis.userId !== auth.userId) return err('Not authorized.', 403);
   const csv = generateCSVReport(shapeAnalysis(analysis));

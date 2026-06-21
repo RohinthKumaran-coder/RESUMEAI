@@ -1,4 +1,5 @@
 import { randomUUID } from 'crypto';
+import { kv } from '@vercel/kv';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -37,17 +38,59 @@ export interface AnalysisRecord {
   updatedAt: Date;
 }
 
-// ─── In-Memory Store ──────────────────────────────────────────────────────────
+// ─── Key helpers ──────────────────────────────────────────────────────────────
+// user:{id}              → UserRecord
+// user_email:{email}     → userId (index)
+// analysis:{id}          → AnalysisRecord
+// user_analyses:{userId} → string[] of analysisIds
 
-const users = new Map<string, UserRecord>();
-const analyses = new Map<string, AnalysisRecord>();
+const K = {
+  user: (id: string) => `user:${id}`,
+  userEmail: (email: string) => `user_email:${email.toLowerCase()}`,
+  analysis: (id: string) => `analysis:${id}`,
+  userAnalyses: (userId: string) => `user_analyses:${userId}`,
+};
+
+// ─── Serialization helpers ────────────────────────────────────────────────────
+// KV stores JSON; Date objects need to survive JSON round-trips.
+
+function hydrateUser(raw: unknown): UserRecord | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const r = raw as Record<string, unknown>;
+  return {
+    ...(r as UserRecord),
+    createdAt: new Date(r.createdAt as string),
+    updatedAt: new Date(r.updatedAt as string),
+  };
+}
+
+function hydrateAnalysis(raw: unknown): AnalysisRecord | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const r = raw as Record<string, unknown>;
+  return {
+    ...(r as AnalysisRecord),
+    createdAt: new Date(r.createdAt as string),
+    updatedAt: new Date(r.updatedAt as string),
+  };
+}
+
+// ─── DB interface ─────────────────────────────────────────────────────────────
 
 export const db = {
   user: {
-    findByEmail: (email: string) =>
-      [...users.values()].find((u) => u.email === email) ?? null,
-    findById: (id: string) => users.get(id) ?? null,
-    create: (data: { email: string; password: string; name?: string | null }): UserRecord => {
+    findByEmail: async (email: string): Promise<UserRecord | null> => {
+      const userId = await kv.get<string>(K.userEmail(email));
+      if (!userId) return null;
+      const raw = await kv.get(K.user(userId));
+      return hydrateUser(raw);
+    },
+
+    findById: async (id: string): Promise<UserRecord | null> => {
+      const raw = await kv.get(K.user(id));
+      return hydrateUser(raw);
+    },
+
+    create: async (data: { email: string; password: string; name?: string | null }): Promise<UserRecord> => {
       const user: UserRecord = {
         id: randomUUID(),
         email: data.email,
@@ -57,26 +100,59 @@ export const db = {
         createdAt: new Date(),
         updatedAt: new Date(),
       };
-      users.set(user.id, user);
+      await kv.set(K.user(user.id), JSON.stringify(user));
+      await kv.set(K.userEmail(user.email), user.id);
       return user;
     },
   },
+
   analysis: {
-    create: (data: Omit<AnalysisRecord, 'id' | 'createdAt' | 'updatedAt'>): AnalysisRecord => {
-      const record: AnalysisRecord = { ...data, id: randomUUID(), createdAt: new Date(), updatedAt: new Date() };
-      analyses.set(record.id, record);
+    create: async (data: Omit<AnalysisRecord, 'id' | 'createdAt' | 'updatedAt'>): Promise<AnalysisRecord> => {
+      const record: AnalysisRecord = {
+        ...data,
+        id: randomUUID(),
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      };
+      await kv.set(K.analysis(record.id), JSON.stringify(record));
+      // Add to user's analysis list
+      const existing = await kv.get<string[]>(K.userAnalyses(record.userId)) ?? [];
+      await kv.set(K.userAnalyses(record.userId), JSON.stringify([record.id, ...existing]));
       return record;
     },
-    findById: (id: string) => analyses.get(id) ?? null,
-    findByUser: (userId: string): AnalysisRecord[] =>
-      [...analyses.values()].filter((a) => a.userId === userId).sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime()),
-    update: (id: string, data: Partial<AnalysisRecord>): AnalysisRecord | null => {
-      const existing = analyses.get(id);
+
+    findById: async (id: string): Promise<AnalysisRecord | null> => {
+      const raw = await kv.get(K.analysis(id));
+      return hydrateAnalysis(raw);
+    },
+
+    findByUser: async (userId: string): Promise<AnalysisRecord[]> => {
+      const ids = await kv.get<string[]>(K.userAnalyses(userId)) ?? [];
+      const records = await Promise.all(ids.map((id) => kv.get(K.analysis(id))));
+      return records
+        .map(hydrateAnalysis)
+        .filter((r): r is AnalysisRecord => r !== null)
+        .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
+    },
+
+    update: async (id: string, data: Partial<AnalysisRecord>): Promise<AnalysisRecord | null> => {
+      const raw = await kv.get(K.analysis(id));
+      const existing = hydrateAnalysis(raw);
       if (!existing) return null;
-      const updated = { ...existing, ...data, updatedAt: new Date() };
-      analyses.set(id, updated);
+      const updated: AnalysisRecord = { ...existing, ...data, updatedAt: new Date() };
+      await kv.set(K.analysis(id), JSON.stringify(updated));
       return updated;
     },
-    delete: (id: string): boolean => analyses.delete(id),
+
+    delete: async (id: string): Promise<boolean> => {
+      const raw = await kv.get(K.analysis(id));
+      const record = hydrateAnalysis(raw);
+      if (!record) return false;
+      await kv.del(K.analysis(id));
+      // Remove from user's analysis list
+      const ids = await kv.get<string[]>(K.userAnalyses(record.userId)) ?? [];
+      await kv.set(K.userAnalyses(record.userId), JSON.stringify(ids.filter((i) => i !== id)));
+      return true;
+    },
   },
 };
